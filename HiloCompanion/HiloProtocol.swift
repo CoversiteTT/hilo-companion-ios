@@ -316,7 +316,7 @@ enum HiloProtocol {
         (UInt16(bytes[offset]) << 8) | UInt16(bytes[offset + 1])
     }
 
-    private static func uint32(_ bytes: [UInt8], at offset: Int) -> UInt32 {
+    fileprivate static func uint32(_ bytes: [UInt8], at offset: Int) -> UInt32 {
         (UInt32(uint16(bytes, at: offset)) << 16) | UInt32(uint16(bytes, at: offset + 2))
     }
 }

@@ -73,6 +73,7 @@ struct AssignedProfiles: Equatable {
 
 enum ProfileReply: Equatable {
     case assigned(AssignedProfiles)
+    case indexes([UInt8])
     case result(accepted: Bool)
 }
 
@@ -147,6 +148,7 @@ enum HistoryPacket: Equatable {
 enum HiloProtocol {
     static let unixThreshold: TimeInterval = 1_704_067_200 // 2024-01-01 UTC
     static let queryProfile = Data([0x00])
+    static let queryProfileIndexes = Data([0x01])
 
     static func setProfile(_ preset: HeatingPreset) -> Data {
         Data([0x03, preset.mode.rawValue, preset.index])
@@ -157,6 +159,9 @@ enum HiloProtocol {
         switch bytes.first {
         case 0x00 where bytes.count >= 5:
             return .assigned(AssignedProfiles(standard: bytes[2], boost: bytes[4]))
+        case 0x01:
+            guard let end = bytes.dropFirst().firstIndex(of: 0xff) else { return nil }
+            return .indexes(Array(bytes[1..<end]))
         case 0x03 where bytes.count >= 3:
             return .result(accepted: uint16(bytes, at: 1) == 0xbeef)
         default:

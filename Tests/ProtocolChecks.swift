@@ -16,7 +16,11 @@ struct ProtocolChecks {
             expect(model.presets.map(HiloProtocol.setProfile) == [bytes("030000"), bytes("030001"), bytes("030110"), bytes("030111")], "1.5 presets")
         }
         expect(HiloProtocol.queryProfile == bytes("00"), "read assigned profiles")
+        expect(HiloProtocol.queryProfileIndexes == bytes("01"), "read available profiles")
         expect(HiloProtocol.profileReply(bytes("0000020110")) == .assigned(.init(standard: 2, boost: 16)), "assigned response")
+        expect(HiloProtocol.profileReply(bytes("0100010210ff")) == .indexes([0, 1, 2, 16]), "index list response")
+        expect(HiloProtocol.profileReply(bytes("01ff")) == .indexes([]), "empty index list")
+        expect(HiloProtocol.profileReply(bytes("01000102")) == nil, "truncated index list")
         expect(HiloProtocol.profileReply(bytes("03beef")) == .result(accepted: true), "acknowledgment")
         expect(HiloProtocol.profileReply(bytes("03efbe")) == .result(accepted: false), "big-endian acknowledgment")
         expect(HiloProtocol.profileReply(bytes("0300")) == nil, "short acknowledgment")

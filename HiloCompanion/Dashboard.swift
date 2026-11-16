@@ -153,6 +153,18 @@ struct Dashboard: View {
                 .buttonStyle(.borderedProminent)
                 .disabled(!bluetooth.canChangePreset)
             }
+            if bluetooth.phase == .connected {
+                Button("读取固件档位") { bluetooth.readProfileIndexes() }
+                    .buttonStyle(.bordered)
+                    .disabled(!bluetooth.canReadProfiles)
+                if let indexes = bluetooth.profileIndexes {
+                    let values = indexes.map(String.init).joined(separator: "、")
+                    Text(values.isEmpty ? "固件返回空列表" : "固件档位编号 \(values)")
+                        .font(.footnote.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+            }
         }
         .card()
     }

@@ -15,11 +15,19 @@ final class HiloBluetooth: NSObject, ObservableObject {
     enum Phase { case idle, scanning, connecting, connected }
 
     private enum ProfilePurpose {
-        case read, set(HeatingPreset), verify(HeatingPreset)
+        case read, readIndexes, set(HeatingPreset), verify(HeatingPreset)
 
         var command: Data {
-            if case let .set(preset) = self { return HiloProtocol.setProfile(preset) }
-            return HiloProtocol.queryProfile
+            switch self {
+            case .read, .verify: return HiloProtocol.queryProfile
+            case .readIndexes: return HiloProtocol.queryProfileIndexes
+            case .set(let preset): return HiloProtocol.setProfile(preset)
+            }
+        }
+
+        var isIndexQuery: Bool {
+            if case .readIndexes = self { return true }
+            return false
         }
     }
 
@@ -49,6 +57,7 @@ final class HiloBluetooth: NSObject, ObservableObject {
     @Published private(set) var penBattery: Int?
     @Published private(set) var session: SessionState?
     @Published private(set) var profiles: AssignedProfiles?
+    @Published private(set) var profileIndexes: [UInt8]?
     @Published private(set) var isProfileBusy = false
     @Published private(set) var profileMessage = "连接设备以读取当前档位。"
     @Published private(set) var history = UsageHistory()
@@ -151,6 +160,12 @@ final class HiloBluetooth: NSObject, ObservableObject {
         startProfileRequest(.read)
     }
 
+    func readProfileIndexes() {
+        guard canReadProfiles else { return }
+        profileIndexes = nil
+        startProfileRequest(.readIndexes)
+    }
+
     func setPreset(_ preset: HeatingPreset) {
         guard canChangePreset, model?.presets.contains(preset) == true,
               profiles?.index(for: preset.mode) != preset.index else { return }
@@ -189,6 +204,7 @@ final class HiloBluetooth: NSObject, ObservableObject {
         profileRequest = nil
         profileWriteInFlight = false
         profiles = nil
+        profileIndexes = nil
         isProfileBusy = false
         profileMessage = "连接设备以读取当前档位。"
         if historySync != nil { abortHistory("连接已断开，请重新同步。") }
@@ -230,10 +246,13 @@ final class HiloBluetooth: NSObject, ObservableObject {
         guard let peripheral, let characteristic = characteristics[.heatingProfile] else { return }
         isProfileBusy = true
         profileRequest = ProfileRequest(purpose: purpose)
-        profileMessage = "正在确认设备档位…"
+        profileMessage = purpose.isIndexQuery ? "正在读取固件档位列表…" : "正在确认设备档位…"
         profileTimer?.cancel()
         profileTimer = schedule(after: 12) { [weak self] in
-            self?.finishProfile("设备未响应。请刷新档位，必要时重新连接。", clearProfiles: true)
+            let message = purpose.isIndexQuery
+                ? "固件未返回档位列表。"
+                : "设备未响应。请刷新档位，必要时重新连接。"
+            self?.failProfile(message)
         }
         if characteristic.isNotifying {
             sendProfileRequest()
@@ -259,7 +278,7 @@ final class HiloBluetooth: NSObject, ObservableObject {
     private func receiveProfile(_ data: Data) {
         guard var request = profileRequest, request.sent, let reply = HiloProtocol.profileReply(data) else { return }
         switch (request.purpose, reply) {
-        case (.set, .result), (.read, .assigned), (.verify, .assigned):
+        case (.set, .result), (.read, .assigned), (.verify, .assigned), (.readIndexes, .indexes):
             request.reply = reply
             profileRequest = request
             completeProfileRequest()
@@ -274,6 +293,9 @@ final class HiloBluetooth: NSObject, ObservableObject {
         case (.read, .assigned(let values)):
             profiles = values
             finishProfile("当前档位已从设备读取。", clearProfiles: false)
+        case (.readIndexes, .indexes(let values)):
+            profileIndexes = values
+            finishProfile("已读取固件档位列表。", clearProfiles: false)
         case (.set(let preset), .result(true)):
             startProfileRequest(.verify(preset))
         case (.set, .result(false)):
@@ -293,6 +315,11 @@ final class HiloBluetooth: NSObject, ObservableObject {
         isProfileBusy = false
         if clearProfiles { profiles = nil }
         profileMessage = message
+    }
+
+    private func failProfile(_ message: String) {
+        guard let request = profileRequest else { return }
+        finishProfile(message, clearProfiles: !request.purpose.isIndexQuery)
     }
 
     private func waitForHistory(seconds: TimeInterval) {
@@ -371,6 +398,7 @@ final class HiloBluetooth: NSObject, ObservableObject {
             if previous != nil || !updated.penPresent {
                 historySource = nil
                 profiles = nil
+                profileIndexes = nil
                 if historySync != nil { abortHistory("加热笔状态已改变，请重新同步。") }
                 if profileRequest != nil { finishProfile("请放回加热笔再读取档位。", clearProfiles: true) }
             }
@@ -478,7 +506,7 @@ extension HiloBluetooth: CBPeripheralDelegate {
         switch field {
         case .heatingProfile:
             if let error, profileRequest != nil {
-                finishProfile(message(for: error), clearProfiles: true)
+                failProfile(message(for: error))
             } else if characteristic.isNotifying {
                 sendProfileRequest()
             }
@@ -503,7 +531,7 @@ extension HiloBluetooth: CBPeripheralDelegate {
         guard peripheral === self.peripheral, kind(of: characteristic) == .heatingProfile else { return }
         profileWriteInFlight = false
         guard var request = profileRequest else { return }
-        if let error { finishProfile(message(for: error), clearProfiles: true); return }
+        if let error { failProfile(message(for: error)); return }
         request.acknowledged = true
         profileRequest = request
         completeProfileRequest()
@@ -514,7 +542,7 @@ extension HiloBluetooth: CBPeripheralDelegate {
         if let error {
             switch field {
             case .heatingProfile where profileRequest != nil:
-                finishProfile(message(for: error), clearProfiles: true)
+                failProfile(message(for: error))
             case .history where historySync != nil:
                 historyMessage = message(for: error)
             case .information, .session:

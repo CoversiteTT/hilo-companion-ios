@@ -41,6 +41,12 @@ struct Dashboard: View {
                     connectionCard
                     heatingCard
                     usageCard
+                    if !bluetooth.availableSettings.isEmpty {
+                        DeviceSettingsCard(bluetooth: bluetooth)
+                    }
+                    if bluetooth.phase == .connected && bluetooth.hasDiagnostics {
+                        DeviceDiagnosticsCard(bluetooth: bluetooth)
+                    }
                 }
                 .frame(maxWidth: 620)
                 .padding(16)
@@ -257,6 +263,160 @@ struct Dashboard: View {
                 .disabled(!bluetooth.canSyncHistory)
         }
         .card()
+    }
+}
+
+private struct DeviceSettingsCard: View {
+    @ObservedObject var bluetooth: HiloBluetooth
+    @State private var brightnessDraft: Double?
+
+    var body: some View {
+        let available = bluetooth.availableSettings
+        VStack(alignment: .leading, spacing: 14) {
+            Label("设备设置", systemImage: "slider.horizontal.3").font(.headline)
+            if available.contains(.brightness) {
+                if let value = bluetooth.displayValue(for: .brightness) {
+                    brightnessControl(value)
+                } else {
+                    pendingValue(.brightness)
+                }
+            }
+            if available.contains(.endWarning) {
+                if let value = bluetooth.displayValue(for: .endWarning) {
+                    Toggle(DeviceSetting.endWarning.title, isOn: Binding(
+                        get: { value == 1 },
+                        set: { bluetooth.setSetting(.endWarning, value: $0 ? 1 : 0) }
+                    ))
+                    .disabled(!bluetooth.canChangeSetting(.endWarning))
+                } else {
+                    pendingValue(.endWarning)
+                }
+            }
+            if available.contains(.buzzer) {
+                if let value = bluetooth.displayValue(for: .buzzer) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(DeviceSetting.buzzer.title).font(.subheadline)
+                        Picker(DeviceSetting.buzzer.title, selection: Binding(
+                            get: { value },
+                            set: { bluetooth.setSetting(.buzzer, value: $0) }
+                        )) {
+                            ForEach(0...Int(DeviceSetting.buzzer.maximum), id: \.self) { level in
+                                Text("\(level)").tag(UInt8(level))
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .disabled(!bluetooth.canChangeSetting(.buzzer))
+                    }
+                } else {
+                    pendingValue(.buzzer)
+                }
+            }
+            if bluetooth.model?.isPlus == true && bluetooth.session?.penPresent == false {
+                Text("把加热笔放入充电盒即可读取笔端设置。")
+                    .font(.footnote).foregroundStyle(.secondary)
+            } else if bluetooth.session?.isActive == true {
+                Text("加热结束后可调整亮度和结束提醒。")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+            if let message = bluetooth.settingMessage {
+                HStack(spacing: 8) {
+                    if bluetooth.isSettingBusy { ProgressView().controlSize(.small) }
+                    Text(message).font(.footnote).foregroundStyle(.secondary)
+                }
+            }
+        }
+        .card()
+        .onChange(of: bluetooth.settings[.brightness]) { _ in brightnessDraft = nil }
+    }
+
+    private func brightnessControl(_ value: UInt8) -> some View {
+        let current = Double(value)
+        let selected = brightnessDraft ?? current
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(DeviceSetting.brightness.title).font(.subheadline)
+                Spacer()
+                Text("\(Int(selected))%").font(.subheadline.monospacedDigit())
+            }
+            Slider(value: Binding(
+                get: { brightnessDraft ?? current },
+                set: { brightnessDraft = $0 }
+            ), in: 0...Double(DeviceSetting.brightness.maximum), step: 1) {
+                Text(DeviceSetting.brightness.title)
+            }
+            .accessibilityValue("\(Int(selected))%")
+            .disabled(!bluetooth.canChangeSetting(.brightness))
+            if let brightnessDraft, brightnessDraft != current {
+                Button("保存亮度") {
+                    bluetooth.setSetting(.brightness, value: UInt8(brightnessDraft))
+                    self.brightnessDraft = nil
+                }
+                .buttonStyle(.bordered)
+                .disabled(!bluetooth.canChangeSetting(.brightness))
+            }
+        }
+    }
+
+    private func pendingValue(_ setting: DeviceSetting) -> some View {
+        LabeledContent(setting.title, value: "—").font(.subheadline)
+    }
+}
+
+private struct DeviceDiagnosticsCard: View {
+    @ObservedObject var bluetooth: HiloBluetooth
+
+    var body: some View {
+        let isPlus = bluetooth.model?.isPlus == true
+        VStack(alignment: .leading, spacing: 12) {
+            Label("设备诊断", systemImage: "stethoscope").font(.headline)
+            if let lastError = bluetooth.lastError {
+                LabeledContent(isPlus ? "充电盒最近故障" : "最近故障", value: errorCode(lastError.code))
+                    .font(.subheadline)
+                if bluetooth.session?.penPresent == true, let code = lastError.penCode {
+                    LabeledContent("加热笔最近故障", value: errorCode(code)).font(.subheadline)
+                }
+            }
+            if let lifecycle = bluetooth.lifecycle {
+                counters(lifecycle.main, title: isPlus ? "充电盒累计数据" : "设备累计数据")
+                if let pen = lifecycle.pen {
+                    counters(pen, title: "加热笔累计数据")
+                }
+            }
+            if let message = bluetooth.diagnosticMessage {
+                HStack(spacing: 8) {
+                    if bluetooth.isReadingDiagnostics { ProgressView().controlSize(.small) }
+                    Text(message).font(.footnote).foregroundStyle(.secondary)
+                }
+            }
+            Button("读取诊断", action: bluetooth.readDiagnostics)
+                .buttonStyle(.bordered)
+                .disabled(!bluetooth.canReadDiagnostics)
+        }
+        .card()
+    }
+
+    private func errorCode(_ code: UInt16) -> String {
+        code == 0 ? "无记录" : String(format: "0x%04X", Int(code))
+    }
+
+    private func counters(_ data: LifecycleCounters, title: String) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title).font(.footnote.weight(.semibold)).foregroundStyle(.secondary)
+            if let completed = data.completedSessions, let incomplete = data.incompleteSessions {
+                LabeledContent("完成会话", value: completed.formatted())
+                LabeledContent("未完成会话", value: incomplete.formatted())
+            }
+            LabeledContent("充满次数", value: data.fullCharges.formatted())
+            if data.minimumBatteryTemperature <= data.maximumBatteryTemperature {
+                LabeledContent("电池温度（原始值）",
+                               value: "\(data.minimumBatteryTemperature) 至 \(data.maximumBatteryTemperature)")
+            }
+            if data.minimumBatteryVoltage <= data.maximumBatteryVoltage {
+                LabeledContent("电池电压（原始值）",
+                               value: "\(data.minimumBatteryVoltage) 至 \(data.maximumBatteryVoltage)")
+            }
+        }
+        .font(.subheadline)
     }
 }
 

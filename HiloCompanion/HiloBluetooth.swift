@@ -48,6 +48,18 @@ final class HiloBluetooth: NSObject, ObservableObject {
         var sessions: [UsageSession] = []
     }
 
+    private struct SettingChange {
+        let setting: DeviceSetting
+        let value: UInt8
+        var verifying = false
+    }
+
+    private enum DiagnosticRequest {
+        case lastError
+        case subscribe
+        case lifecycle(acknowledged: Bool, response: HiloLifecycle?)
+    }
+
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var linkMessage = "未连接"
     @Published private(set) var nearby: [NearbyHilo] = []
@@ -64,6 +76,12 @@ final class HiloBluetooth: NSObject, ObservableObject {
     @Published private(set) var isSyncing = false
     @Published private(set) var historyMessage = "从设备同步记录。"
     @Published private(set) var hasHistoryStorageError = false
+    @Published private(set) var settings: [DeviceSetting: UInt8] = [:]
+    @Published private(set) var settingMessage: String?
+    @Published private(set) var hasDiagnostics = false
+    @Published private(set) var lastError: HiloLastError?
+    @Published private(set) var lifecycle: HiloLifecycle?
+    @Published private(set) var diagnosticMessage: String?
 
     private var manager: CBCentralManager?
     private var peripheral: CBPeripheral?
@@ -73,9 +91,15 @@ final class HiloBluetooth: NSObject, ObservableObject {
     private var profileRequest: ProfileRequest?
     @Published private var profileWriteInFlight = false
     private var historySync: HistorySync?
+    @Published private var settingChange: SettingChange?
+    @Published private var diagnosticRequest: DiagnosticRequest?
+    private var settingsNeedReconnect = false
+    private var diagnosticsNeedReconnect = false
     private var linkTimer: DispatchWorkItem?
     private var profileTimer: DispatchWorkItem?
     private var historyTimer: DispatchWorkItem?
+    private var settingTimer: DispatchWorkItem?
+    private var diagnosticTimer: DispatchWorkItem?
     private let store = HistoryStore()
 
     override init() {
@@ -103,6 +127,36 @@ final class HiloBluetooth: NSObject, ObservableObject {
         guard phase == .connected, !isSyncing, !hasHistoryStorageError,
               historySource != nil, let characteristic = characteristics[.history] else { return false }
         return supportsNotifications(characteristic) && (model?.isPlus != true || session?.penPresent == true)
+    }
+
+    var availableSettings: [DeviceSetting] {
+        guard phase == .connected, let model else { return [] }
+        return DeviceSetting.allCases.filter { setting in
+            guard setting.isSupported(on: model), let characteristic = characteristics[setting.characteristic] else {
+                return false
+            }
+            return characteristic.properties.contains([.read, .write])
+        }
+    }
+
+    var isSettingBusy: Bool { settingChange != nil }
+    var isReadingDiagnostics: Bool { diagnosticRequest != nil }
+
+    var canReadDiagnostics: Bool {
+        phase == .connected && hasDiagnostics && !isReadingDiagnostics && !diagnosticsNeedReconnect
+            && (characteristics[.lastError]?.properties.contains(.read) == true || canQueryLifecycle)
+    }
+
+    func canChangeSetting(_ setting: DeviceSetting) -> Bool {
+        guard !isSettingBusy, !settingsNeedReconnect,
+              settings[setting] != nil, availableSettings.contains(setting) else { return false }
+        return setting == .buzzer
+            || (session?.isActive == false && (model?.isPlus != true || session?.penPresent == true))
+    }
+
+    func displayValue(for setting: DeviceSetting) -> UInt8? {
+        if let change = settingChange, change.setting == setting { return change.value }
+        return settings[setting]
     }
 
     func scan() {
@@ -151,7 +205,11 @@ final class HiloBluetooth: NSObject, ObservableObject {
         read(.clock)
         read(.information)
         read(.battery)
-        read(.session)
+        if !isSettingBusy {
+            read(.session)
+            refreshBrightness()
+            if availableSettings.contains(.buzzer) { read(.buzzer) }
+        }
         readProfiles()
     }
 
@@ -182,6 +240,33 @@ final class HiloBluetooth: NSObject, ObservableObject {
         waitForHistory(seconds: 18)
     }
 
+    func setSetting(_ setting: DeviceSetting, value: UInt8) {
+        guard canChangeSetting(setting), value != settings[setting],
+              let data = setting.writeValue(value),
+              let peripheral, let characteristic = characteristics[setting.characteristic] else { return }
+        settingChange = SettingChange(setting: setting, value: value)
+        settingMessage = "正在保存\(setting.title)…"
+        settingTimer = schedule(after: 10) { [weak self] in
+            guard let self, let change = self.settingChange else { return }
+            self.settingsNeedReconnect = true
+            self.finishSettingChange("未能确认\(change.setting.title)，请重新连接后重试。")
+        }
+        peripheral.writeValue(data, for: characteristic, type: .withResponse)
+    }
+
+    func readDiagnostics() {
+        guard canReadDiagnostics else { return }
+        lastError = nil
+        lifecycle = nil
+        diagnosticMessage = "正在读取设备诊断…"
+        diagnosticRequest = .lastError
+        if read(.lastError) {
+            waitForDiagnostics()
+        } else {
+            startLifecycleRead()
+        }
+    }
+
     private func disconnect(message: String) {
         if let peripheral { manager?.cancelPeripheralConnection(peripheral) }
         resetLink(message: message)
@@ -191,6 +276,8 @@ final class HiloBluetooth: NSObject, ObservableObject {
         linkTimer?.cancel()
         profileTimer?.cancel()
         historyTimer?.cancel()
+        settingTimer?.cancel()
+        diagnosticTimer?.cancel()
         peripheral?.delegate = nil
         peripheral = nil
         characteristics.removeAll()
@@ -207,6 +294,16 @@ final class HiloBluetooth: NSObject, ObservableObject {
         profileIndexes = nil
         isProfileBusy = false
         profileMessage = "连接设备以读取当前档位。"
+        settings = [:]
+        settingChange = nil
+        settingMessage = nil
+        settingsNeedReconnect = false
+        diagnosticRequest = nil
+        diagnosticsNeedReconnect = false
+        hasDiagnostics = false
+        lastError = nil
+        lifecycle = nil
+        diagnosticMessage = nil
         if historySync != nil { abortHistory("连接已断开，请重新同步。") }
         phase = .idle
         linkMessage = message
@@ -395,6 +492,21 @@ final class HiloBluetooth: NSObject, ObservableObject {
         let previous = session
         session = updated
         if model.isPlus && previous?.penPresent != updated.penPresent {
+            if previous != nil {
+                settings.removeValue(forKey: .brightness)
+                lastError = nil
+                lifecycle = nil
+                if let change = settingChange, change.setting != .buzzer {
+                    settingsNeedReconnect = true
+                    finishSettingChange("加热笔状态已改变，请重新连接后设置。")
+                }
+                if isReadingDiagnostics {
+                    diagnosticsNeedReconnect = true
+                    finishDiagnostics("加热笔状态已改变，请重新连接后读取诊断。")
+                } else if !diagnosticsNeedReconnect {
+                    diagnosticMessage = nil
+                }
+            }
             if previous != nil || !updated.penPresent {
                 historySource = nil
                 profiles = nil
@@ -406,10 +518,114 @@ final class HiloBluetooth: NSObject, ObservableObject {
                 read(.information)
                 read(.battery)
                 readProfiles()
+                refreshBrightness()
             } else {
                 penBattery = nil
                 profileMessage = "请把加热笔放入充电盒。"
             }
+        }
+        let warning = updated.penPresent ? updated.endWarningEnabled : nil
+        receiveSetting(.endWarning, value: warning.map { $0 ? 1 : 0 })
+    }
+}
+
+private extension HiloBluetooth {
+    func refreshBrightness() {
+        guard settingChange?.setting != .brightness, availableSettings.contains(.brightness),
+              model?.isPlus != true || session?.penPresent == true else { return }
+        read(.brightness)
+    }
+
+    func verifySettingWrite(_ field: HiloCharacteristic, error: Error?) {
+        guard var change = settingChange, !change.verifying,
+              change.setting.characteristic == field else { return }
+        if let error {
+            finishSettingChange(message(for: error))
+            return
+        }
+        change.verifying = true
+        settingChange = change
+        read(field)
+    }
+
+    func receiveSetting(_ setting: DeviceSetting, value: UInt8?) {
+        if settings[setting] != value { settings[setting] = value }
+        guard let change = settingChange, change.verifying, change.setting == setting else { return }
+        if value == change.value {
+            finishSettingChange("已从设备确认\(setting.title)。")
+        } else if setting != .endWarning {
+            finishSettingChange("设备回报的\(setting.title)与所选值不同。")
+        }
+        // Session notifications can arrive before the end-warning readback.
+    }
+
+    func finishSettingChange(_ message: String) {
+        settingTimer?.cancel()
+        settingChange = nil
+        settingMessage = message
+    }
+
+    var canQueryLifecycle: Bool {
+        guard model?.isPlus != true || session?.penPresent == true,
+              let characteristic = characteristics[.lifecycle] else { return false }
+        return characteristic.properties.contains(.write) && supportsNotifications(characteristic)
+    }
+
+    func waitForDiagnostics() {
+        diagnosticTimer?.cancel()
+        diagnosticTimer = schedule(after: 12) { [weak self] in
+            guard let self, self.isReadingDiagnostics else { return }
+            self.diagnosticsNeedReconnect = true
+            self.finishDiagnostics("诊断读取超时，请重新连接后重试。")
+        }
+    }
+
+    func startLifecycleRead() {
+        guard canQueryLifecycle, let peripheral, let characteristic = characteristics[.lifecycle] else {
+            finishDiagnostics()
+            return
+        }
+        diagnosticRequest = .subscribe
+        waitForDiagnostics()
+        if characteristic.isNotifying {
+            sendLifecycleQuery()
+        } else {
+            peripheral.setNotifyValue(true, for: characteristic)
+        }
+    }
+
+    func sendLifecycleQuery() {
+        guard case .subscribe? = diagnosticRequest, canQueryLifecycle,
+              let peripheral, let characteristic = characteristics[.lifecycle] else { return }
+        diagnosticRequest = .lifecycle(acknowledged: false, response: nil)
+        waitForDiagnostics()
+        peripheral.writeValue(HiloProtocol.queryLifecycle, for: characteristic, type: .withResponse)
+    }
+
+    func receiveLifecycle(acknowledged: Bool, response: HiloLifecycle?) {
+        if acknowledged, let response {
+            lifecycle = response
+            finishDiagnostics()
+        } else {
+            diagnosticRequest = .lifecycle(acknowledged: acknowledged, response: response)
+        }
+    }
+
+    func finishDiagnostics(_ message: String? = nil) {
+        diagnosticTimer?.cancel()
+        diagnosticRequest = nil
+        if let message {
+            diagnosticMessage = message
+        } else if lastError != nil && lifecycle != nil {
+            diagnosticMessage = "已读取最近故障和设备累计数据。"
+        } else if lifecycle != nil {
+            diagnosticMessage = "已读取设备累计数据。"
+        } else if lastError != nil {
+            diagnosticMessage = model?.isPlus == true && session?.penPresent == false
+                ? "已读取最近故障。放回加热笔可读取累计数据。"
+                : "已读取最近故障。"
+        } else {
+            diagnosticMessage = "设备未返回可识别的诊断数据。"
         }
     }
 }
@@ -453,7 +669,8 @@ extension HiloBluetooth: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         guard peripheral === self.peripheral else { return }
         linkMessage = "正在识别设备服务…"
-        peripheral.discoverServices(HiloModel.allCases.map { CBUUID(string: $0.serviceID) })
+        let services = HiloModel.allCases.flatMap { [CBUUID(string: $0.serviceID), CBUUID(string: $0.diagnosticServiceID)] }
+        peripheral.discoverServices(services)
     }
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
@@ -471,25 +688,43 @@ extension HiloBluetooth: CBCentralManagerDelegate {
 extension HiloBluetooth: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         guard peripheral === self.peripheral else { return }
-        for service in peripheral.services ?? [] {
-            if let found = HiloModel.allCases.first(where: { CBUUID(string: $0.serviceID) == service.uuid }) {
-                model = found
-                peripheral.discoverCharacteristics(HiloCharacteristic.allCases.map { CBUUID(string: found.uuid($0)) }, for: service)
-                return
-            }
+        let services = peripheral.services ?? []
+        guard let found = HiloModel.allCases.first(where: { model in
+            services.contains { $0.uuid == CBUUID(string: model.serviceID) }
+        }), let sessionService = services.first(where: { $0.uuid == CBUUID(string: found.serviceID) }) else {
+            disconnect(message: error.map { message(for: $0) } ?? "没有找到受支持的 Hilo 服务。")
+            return
         }
-        disconnect(message: error.map { message(for: $0) } ?? "没有找到受支持的 Hilo 服务。")
+        model = found
+        peripheral.discoverCharacteristics(nil, for: sessionService)
+        if let diagnosticService = services.first(where: { $0.uuid == CBUUID(string: found.diagnosticServiceID) }) {
+            peripheral.discoverCharacteristics(nil, for: diagnosticService)
+        }
     }
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
         guard peripheral === self.peripheral, let model else { return }
-        if let error { disconnect(message: message(for: error)); return }
+        let diagnostic = service.uuid == CBUUID(string: model.diagnosticServiceID)
+        if let error {
+            if !diagnostic { disconnect(message: message(for: error)) }
+            return
+        }
         for characteristic in service.characteristics ?? [] {
-            if let field = HiloCharacteristic.allCases.first(where: { CBUUID(string: model.uuid($0)) == characteristic.uuid }) {
+            if let field = HiloCharacteristic.allCases.first(where: {
+                $0.isDiagnostic == diagnostic && CBUUID(string: model.uuid($0)) == characteristic.uuid
+            }) {
                 characteristics[field] = characteristic
             }
         }
-        guard !characteristics.isEmpty else { disconnect(message: "设备没有提供可识别的蓝牙特征。"); return }
+        if diagnostic {
+            hasDiagnostics = characteristics[.lastError]?.properties.contains(.read) == true
+                || characteristics[.lifecycle].map { $0.properties.contains(.write) && supportsNotifications($0) } == true
+            return
+        }
+        guard characteristics.keys.contains(where: { !$0.isDiagnostic }) else {
+            disconnect(message: "设备没有提供可识别的蓝牙特征。")
+            return
+        }
         linkTimer?.cancel()
         phase = .connected
         linkMessage = "已连接"
@@ -522,24 +757,48 @@ extension HiloBluetooth: CBPeripheralDelegate {
                 historySync = sync
                 read(.history)
             }
+        case .lifecycle:
+            guard case .subscribe? = diagnosticRequest else { return }
+            if let error {
+                finishDiagnostics(message(for: error))
+            } else if characteristic.isNotifying {
+                sendLifecycleQuery()
+            }
         default:
             break
         }
     }
 
     func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
-        guard peripheral === self.peripheral, kind(of: characteristic) == .heatingProfile else { return }
-        profileWriteInFlight = false
-        guard var request = profileRequest else { return }
-        if let error { failProfile(message(for: error)); return }
-        request.acknowledged = true
-        profileRequest = request
-        completeProfileRequest()
+        guard peripheral === self.peripheral, let field = kind(of: characteristic) else { return }
+        switch field {
+        case .heatingProfile:
+            profileWriteInFlight = false
+            guard var request = profileRequest else { return }
+            if let error { failProfile(message(for: error)); return }
+            request.acknowledged = true
+            profileRequest = request
+            completeProfileRequest()
+        case .session, .brightness, .buzzer:
+            verifySettingWrite(field, error: error)
+        case .lifecycle:
+            guard case .lifecycle(_, let response)? = diagnosticRequest else { return }
+            if let error {
+                finishDiagnostics(message(for: error))
+            } else {
+                receiveLifecycle(acknowledged: true, response: response)
+            }
+        default:
+            break
+        }
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         guard peripheral === self.peripheral, let model, let field = kind(of: characteristic) else { return }
         if let error {
+            if let change = settingChange, change.verifying, change.setting.characteristic == field {
+                finishSettingChange(message(for: error))
+            }
             switch field {
             case .heatingProfile where profileRequest != nil:
                 failProfile(message(for: error))
@@ -547,6 +806,13 @@ extension HiloBluetooth: CBPeripheralDelegate {
                 historyMessage = message(for: error)
             case .information, .session:
                 linkMessage = message(for: error)
+            case .lastError:
+                if case .lastError? = diagnosticRequest { startLifecycleRead() }
+            case .lifecycle:
+                if case .lifecycle? = diagnosticRequest {
+                    diagnosticsNeedReconnect = true
+                    finishDiagnostics(message(for: error))
+                }
             default:
                 break
             }
@@ -574,10 +840,24 @@ extension HiloBluetooth: CBPeripheralDelegate {
             }
         case .session:
             updateSession(data, model: model)
+        case .brightness:
+            guard model.isPlus == false || session?.penPresent == true else { return }
+            receiveSetting(.brightness, value: DeviceSetting.brightness.readValue(data))
+        case .buzzer:
+            guard DeviceSetting.buzzer.isSupported(on: model) else { return }
+            receiveSetting(.buzzer, value: DeviceSetting.buzzer.readValue(data))
         case .heatingProfile:
             receiveProfile(data)
         case .history:
             receiveHistory(data)
+        case .lastError:
+            guard case .lastError? = diagnosticRequest else { return }
+            lastError = HiloLastError(data, model: model)
+            startLifecycleRead()
+        case .lifecycle:
+            guard case .lifecycle(let acknowledged, _)? = diagnosticRequest,
+                  let response = HiloLifecycle(data, model: model) else { return }
+            receiveLifecycle(acknowledged: acknowledged, response: response)
         }
     }
 }
